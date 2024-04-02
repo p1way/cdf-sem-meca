@@ -40,6 +40,22 @@ Definition code := list instr.
 
 Definition codelen (c: code) : Z := Z.of_nat (List.length c).
 
+(** Deux petits lemmes utiles *)
+
+Lemma codelen_cons:
+  forall i c, codelen (i :: c) = codelen c + 1.
+Proof.
+  unfold codelen; intros; cbn; lia.
+Qed.
+
+Lemma codelen_app:
+  forall c1 c2, codelen (c1 ++ c2) = codelen c1 + codelen c2.
+Proof.
+  induction c1; intros. 
+- auto.
+- cbn [app]. rewrite ! codelen_cons. rewrite IHc1. lia.
+Qed.
+
 (** *** 2.1.2.  Sémantique opérationnelle *)
 
 (** La machine opère sur un code [C] (une liste fixée d'instructions)
@@ -167,7 +183,17 @@ Fixpoint mach_exec (C: code) (fuel: nat)
       match instr_at C pc, σ with
       | Some Ihalt, nil => OK s
       | Some (Iconst n), σ => mach_exec C fuel' (pc + 1) (n :: σ) s
-      (* FILL IN HERE *)
+      | Some (Ivar x), σ => mach_exec C fuel' (pc + 1) (s x :: σ) s
+      | Some (Isetvar x), n :: σ' => mach_exec C fuel' (pc + 1) σ (update x n s)
+      | Some Iadd, n1 :: n2 :: σ => mach_exec C fuel' (pc + 1) (n1+n2 :: σ) s
+      | Some Iopp, n :: σ => mach_exec C fuel' (pc + 1) (-n :: σ) s
+      | Some (Ibranch d), σ => mach_exec C fuel' (pc + 1 + d) σ s
+      | Some (Ibeq d1 d0), n1 :: n2 :: σ => if n1 =? n2
+                                         then mach_exec C fuel' (pc + 1 + d1) σ s
+                                         else mach_exec C fuel' (pc + 1 + d0) σ s
+      | Some (Ible d1 d0), n1 :: n2 :: σ => if n1 <=? n2
+                                         then mach_exec C fuel' (pc + 1 + d1) σ s
+                                         else mach_exec C fuel' (pc + 1 + d0) σ s
       | _, _ => Stuck
       end
   end.
@@ -255,6 +281,10 @@ Eval compute in (compile_bexp (NOT (AND TRUE FALSE)) 12 34).
 
 (** Résultat: [ Ibranch 12 :: nil ] *)
 
+Eval compute in (compile_bexp (NOT (NOT (AND TRUE FALSE))) 0 34).
+
+Eval compute in (compile_bexp (NOT (NOT (AND TRUE FALSE))) 12 34).
+
 (** Pour finir, voici la compilation des commandes.  
     Le code produit pour la commande [c] met à jour l'état mémoire
     (les valeurs des variables) comme prescrit par la sémantique de [c].
@@ -263,6 +293,185 @@ Eval compute in (compile_bexp (NOT (AND TRUE FALSE)) 12 34).
     Là encore, on se reportera aux transparents du cours pour une
     explication des déplacements sur les instructions de branchement.
 *)
+
+Definition smart_Ibranch (d: Z) : code :=
+  if d =? 0 then nil else Ibranch d :: nil.
+
+(** On peut voir que la compilation des atomes TRUE et FALSE dépend des valeurs de saut d1 et d0 respectivement. Ce n'est pas très commode pour calculer a priori la taille d'un code compilé à partir d'une expression bexp quelconque, indépendamment des valeurs de saut. On définit alors une forme réduite d'une expression bexp qui élimine les atomes TRUE et FALSE des formules (sauf bien sûr dans les cas où la formule se résume à l'un de ces deux atomes). *)
+
+Inductive is_red : bexp -> Prop :=
+| is_red_t : is_red TRUE
+| is_red_f : is_red FALSE
+| is_red_eq : forall a1 a2, is_red (EQUAL a1 a2)
+| is_red_le : forall a1 a2, is_red (LESSEQUAL a1 a2)
+| is_red_not : forall b0,
+    is_red b0 -> b0 <> TRUE -> b0 <> FALSE ->
+    is_red (NOT b0)
+| is_red_and : forall b1 b2,
+    is_red b1 -> b1 <> TRUE -> b1 <> FALSE ->
+    is_red b2 -> b2 <> TRUE -> b2 <> FALSE ->
+    is_red (AND b1 b2).
+
+(** On introduit une fonction pour calculer la forme réduite d'une expression bexp *)
+
+Fixpoint red_bexp (b: bexp) : bexp :=
+  match b with
+  | NOT b'    => match red_bexp b' with
+                | TRUE => FALSE
+                | FALSE => TRUE
+                | NOT b'' => b'' (* Réduction supplémentaire, non imposée par le prédicat is_red...mais ça ne mange pas de pain. *)
+                | b'' => NOT b''
+                end
+  | AND b1 b2 => match (red_bexp b1, red_bexp b2) with
+                | (FALSE, _) | (_, FALSE) => FALSE
+                | (TRUE, b') | (b', TRUE) => b'
+                | (b1',b2') => AND b1' b2'
+                end
+  | _ => b
+  end.
+
+(** Quelques tests de réduction *)
+
+Eval compute in red_bexp (OR TRUE (EQUAL (CONST 0) (CONST 1))).
+
+(** Résultat: TRUE. *)
+
+Eval compute in red_bexp (OR FALSE (EQUAL (CONST 0) (CONST 1))).
+
+(** Résultat: EQUAL (CONST 0) (CONST 1)). *)
+
+Eval compute in red_bexp (NOT (NOT TRUE)).
+
+(** Résultat: TRUE. *)
+
+(** On vérifie que l'on calcule bien une forme réduite au sens du prédicat is_red *)
+
+Lemma red_bexp_is_red :
+  forall b, is_red (red_bexp b).
+Proof.
+  induction b; cbn; try constructor.
+  - (* NOT *)
+    inversion IHb; try constructor; congruence.
+  - (* AND *)
+    inversion IHb1; inversion IHb2; try constructor; congruence.
+Qed.
+
+(** On prouve ci-après qu'une formule réduite a bien la sémantique attendue. *)
+
+Hint Rewrite negb_involutive andb_true_r andb_true_l andb_false_r andb_false_l : bexp.
+
+Lemma beval_red :
+  forall s b, beval b s = beval (red_bexp b) s.
+Proof.
+  induction b; cbn; auto.
+  - (* NOT *)
+    rewrite IHb.
+    case (red_bexp b); cbn; intros; autorewrite with bexp; reflexivity.
+  - (* AND *)
+    rewrite IHb1, IHb2.
+    case (red_bexp b1), (red_bexp b2); cbn; autorewrite with bexp; reflexivity.
+Qed.
+
+(** Quelques tests montrent que compiler la forme réduite d'une bexp constitue une optimisation. *)
+Eval compute in (compile_bexp (red_bexp (OR TRUE (EQUAL (CONST 0) (CONST 1)))) 0 2) .
+Eval compute in (compile_bexp (red_bexp (TRUE)) 0 2) .
+
+Eval compute in (compile_bexp (AND TRUE FALSE) 1 2).
+Eval compute in (compile_bexp (AND FALSE TRUE) 1 2).
+Eval compute in (compile_bexp FALSE 1 2) .
+
+(** On peut alors calculer la taille d'un code compilé à partir d'une bexp réduite. *)
+
+Fixpoint len_aexp (a: aexp) : Z :=
+  match a with
+  | CONST _ => 1
+  | VAR _ => 1
+  | PLUS a1 a2 => len_aexp a1 + len_aexp a2 + 1
+  | MINUS a1 a2 => len_aexp a1 + len_aexp a2 + 2
+  end.
+  
+Fixpoint len_bexp (b: bexp) : Z :=
+  match b with
+  | EQUAL a1 a2 => len_aexp a1 + len_aexp a2 + 1
+  | LESSEQUAL a1 a2 => len_aexp a1 + len_aexp a2 + 1
+  | NOT b0 => len_bexp b0
+  | AND b1 b2 => len_bexp b1 + len_bexp b2
+  | TRUE => 1  (* /!\ Attention ! Ici, ce n'est correct que si on compile avec d1 non nul /!\  *)
+  | FALSE => 0 (* /!\ Attention ! Ici, ce n'est correct que si on compile avec d0 nul /!\  *)
+  end.
+
+(** On vérifie que l'on calcule bien la bonne longueur, quelque soit les valeurs de saut d1 et d0 (dans le cas d'une bexp réduite différente de TRUE ou FALSE). *)
+
+Lemma correct_len_aexp :
+  forall a, len_aexp a = codelen (compile_aexp a).
+Proof.
+  induction a.
+  1,2: cbn; reflexivity.
+  1,2: cbn; rewrite ! codelen_app; cbn; rewrite IHa1, IHa2; lia.
+Qed.
+
+Lemma correct_len_bexp :
+  forall b,
+    is_red b -> b<>TRUE -> b<>FALSE ->
+    forall d1 d0, len_bexp b = codelen (compile_bexp b d1 d0).
+Proof.
+  intros b H H0 H1; induction H.
+  1,2: congruence.
+  1,2: intros; cbn; rewrite ! codelen_app; cbn; rewrite ! correct_len_aexp; rewrite Z.add_assoc; reflexivity.
+  - (* NOT *)
+    intros; cbn; erewrite IHis_red; [reflexivity | auto | auto].
+  - (* AND *)
+    intros; cbn; rewrite ! codelen_app; erewrite IHis_red1, IHis_red2; auto.
+Qed.
+
+(** En particulier, on montre que pour d1 <> 0 et d0 = 0, on calcule la bonne longueur du code compilé à partir de la forme réduite de n'importe quelle bexp. *)
+Remark correct_len_bexp_d_O :
+  forall b d1, d1 <> 0 -> let b' := red_bexp b in
+      len_bexp b' = codelen (compile_bexp b' d1 0).
+Proof.
+  intros.
+  (* on va procéder par cas... *)
+  assert (b' = TRUE \/ b' = FALSE \/ (b' <> TRUE /\ b' <> FALSE)).
+  induction b'.
+  left; reflexivity.
+  right; left; reflexivity.
+  1-4: right; right; split; discriminate.
+  destruct H0; [idtac | destruct H0].
+  (* cas WHILE TRUE *)
+  rewrite H0; cbn.
+  induction d1. contradiction. 1,2: cbn; reflexivity.
+  (* cas WHILE FALSE*)
+  rewrite H0; cbn; reflexivity.
+  (* pour tous les autres cas, on utilise les bonnes propriétés de la forme réduite des bexp. *)
+  destruct H0. erewrite correct_len_bexp; [reflexivity| apply red_bexp_is_red | auto | auto].
+Qed.
+
+(** Les trois petites remarques suivantes ne sont pas très intéressantes mais nous seront utiles dans la preuve de correction de notre compilateur. On en n'a besoin que pour gérer un cas très particulier : la compilation de la commande "WHILE FALSE SKIP"...que personne n'aurait l'idée saugrenue d'écrire ! :( *)
+
+Remark len_aexp_geq_O :
+  forall a, len_aexp a >= 0.
+Proof.
+  induction a ; cbn; try lia.
+Qed.
+
+Remark len_bexp_geq_O :
+  forall b, len_bexp b >= 0.
+Proof.
+  induction b ; cbn; try lia.
+  1,2: assert (len_aexp a1 >= 0 /\ len_aexp a2 >= 0); [split; apply len_aexp_geq_O| lia].
+Qed.
+
+Remark len_FALSE_eq_O :
+  forall b, is_red b -> len_bexp b = 0 -> b = FALSE.
+Proof.
+  intros; induction H; cbn in H0.
+  lia.
+  reflexivity.
+  1,2: assert (len_aexp a1 >= 0 /\ len_aexp a2 >= 0); [split; apply len_aexp_geq_O| lia].
+  apply IHis_red in H0; contradiction.
+  assert (len_bexp b1 >= 0 /\ len_bexp b2 >= 0). split; apply len_bexp_geq_O.
+  assert (len_bexp b1 = 0); [lia | apply IHis_red1 in H7; contradiction].
+Qed.
 
 Fixpoint compile_com (c: com) : code :=
   match c with
@@ -275,17 +484,21 @@ Fixpoint compile_com (c: com) : code :=
   | IFTHENELSE b ifso ifnot =>
       let code_ifso := compile_com ifso in
       let code_ifnot := compile_com ifnot in
-      compile_bexp b 0 (codelen code_ifso + 1)
+      let code_branch := smart_Ibranch (codelen code_ifnot) in
+      compile_bexp b 0 (codelen (code_ifso ++ code_branch))
       ++ code_ifso
-      ++ Ibranch (codelen code_ifnot)
-      :: code_ifnot
+      ++ code_branch
+      ++ code_ifnot
   | WHILE b body =>
+      let b_red := red_bexp b in
       let code_body := compile_com body in
-      let code_test := compile_bexp b 0 (codelen code_body + 1) in
-      code_test
-      ++ code_body
-      ++ Ibranch (- (codelen code_test + codelen code_body + 1)) :: nil
+      let delta1 := len_bexp b_red in
+      let code_test := compile_bexp b_red (- (codelen code_body + delta1)) 0 in 
+      Ibranch (codelen code_body)
+      :: code_body
+      ++ code_test
   end.
+
 
 (** Le code compilé pour un programme complet [p] (une commande)
     est similaire, mais termine proprement sur une instruction [Ihalt]. *)
@@ -315,8 +528,8 @@ Eval compute in (compile_program (IFTHENELSE (EQUAL (VAR "x") (CONST 1)) (ASSIGN
     Pouvez-vous modifier [compile_com] pour éviter cette inefficacité?
     Indication: la fonction ci-dessous vous sera utile. *)
 
-Definition smart_Ibranch (d: Z) : code :=
-  if d =? 0 then nil else Ibranch d :: nil.
+(*Definition smart_Ibranch (d: Z) : code :=
+  if d =? 0 then nil else Ibranch d :: nil.*)
 
 (** ** 2.3.  Correction du code produit pour les expressions *)
 
@@ -331,20 +544,6 @@ Inductive code_at: code -> Z -> code -> Prop :=
       code_at (C1 ++ C2 ++ C3) pc C2.
 
 (** Voici des lemmes utiles concernant les prédicats [instr_at] et [code_at]. *)
-
-Lemma codelen_cons:
-  forall i c, codelen (i :: c) = codelen c + 1.
-Proof.
-  unfold codelen; intros; cbn; lia.
-Qed.
-
-Lemma codelen_app:
-  forall c1 c2, codelen (c1 ++ c2) = codelen c1 + codelen c2.
-Proof.
-  induction c1; intros. 
-- auto.
-- cbn [app]. rewrite ! codelen_cons. rewrite IHc1. lia.
-Qed.
 
 Lemma instr_at_app:
   forall i c2 c1 pc,
@@ -547,13 +746,58 @@ Qed.
     La démonstration se fait sans peine par récurrence sur la dérivation
     de cette exécution [exec s c s'].  Une récurrence sur la structure 
     de [c] ne suffirait pas pour gérer le cas des boucles.
-*)
+ *)
+
+(** *** Exercice (2 étoiles) *)
+
+(** Dans un exercice précédent, vous avez modifié [compile_com] afin
+    d'utiliser [smart_Ibranch] au lieu de [Ibranch] et de produire
+    du code plus efficace.  Il vous reste à adapter la démonstration
+    de [compile_com_correct_terminating] en conséquence.
+    Indication: montrer d'abord le lemme ci-dessous. *)
+
+Lemma transitions_smart_Ibranch:
+  forall C pc d pc' σ s,
+  code_at C pc (smart_Ibranch d) ->
+  pc' = pc + codelen (smart_Ibranch d) + d ->
+  transitions C (pc, σ, s) (pc', σ, s).
+Proof.
+  unfold smart_Ibranch; intros.
+  induction d; cbn in H0; cbn in H.
+  1: autorewrite with code in H0; subst; constructor.
+  1,2: apply star_one; eapply trans_branch; eauto with code.
+Qed.
+
+(** Pour montrer que l'on peut compiler un "WHILE DO" comme un "DO WHILE", on montre au préalable que si on sait comment s'exécute un code qui commence par un saut, on sait aussi comment s'exécute le code qui suit le saut. *)
+    
+Lemma unique_trans_branch:
+  forall C pc d σ s b,
+    instr_at C pc = Some (Ibranch d) ->
+    transition C (pc, σ, s) b ->
+    b = ((pc + 1 + d), σ, s).
+Proof.
+  intros; inversion H0; congruence.
+Qed.
+
+Lemma compile_after_branch:
+  forall C pc pc' d σ σ' s s',
+    instr_at C pc = Some (Ibranch d) ->
+    pc <> pc' ->
+    transitions C (pc, σ, s) (pc', σ', s') ->
+    transitions C (pc + 1 + d, σ, s) (pc', σ', s').
+Proof.
+  intros; inversion H1.
+  contradiction.
+  assert (b = (pc + 1 + d, σ, s)).
+  apply unique_trans_branch with (C:=C); trivial.
+  rewrite <- H6; apply H3.
+Qed.
 
 Lemma compile_com_correct_terminating:
   forall s c s',
-  cexec s c s' ->
-  forall C pc σ,
-  code_at C pc (compile_com c) ->
+    cexec s c s' ->
+    forall C pc σ,
+      (code_at C pc (compile_com c)) ->
   transitions C
       (pc, σ, s)
       (pc + codelen (compile_com c), σ, s').
@@ -564,10 +808,10 @@ Proof.
   autorewrite with code. apply star_refl.
 
 - (* ASSIGN *)
-  eapply star_trans. apply compile_aexp_correct with (a := a). eauto with code. 
+  eapply star_trans. apply compile_aexp_correct with (a := a). eauto with code.
   apply star_one. autorewrite with code. apply trans_setvar. eauto with code.
 
-- (* SEQUENCE *) 
+- (* SEQUENCE *)
   eapply star_trans.
   apply IHcexec1. eauto with code.
   autorewrite with code. apply IHcexec2. eauto with code.
@@ -575,41 +819,62 @@ Proof.
 - (* IFTHENELSE *)
   set (code1 := compile_com c1) in *.
   set (code2 := compile_com c2) in *.
-  set (codeb := compile_bexp b 0 (codelen code1 + 1)) in *.
+  set (codeb := compile_bexp b 0 (codelen (code1 ++ smart_Ibranch (codelen code2) ))) in *.
   eapply star_trans.
   apply compile_bexp_correct with (b := b). eauto with code.
   fold codeb. destruct (beval b s); autorewrite with code.
   + (* la branche "then" est exécutée *)
     eapply star_trans. apply IHcexec. eauto with code.
-    fold code1. apply star_one. apply trans_branch with (d := codelen code2). eauto with code. lia.
+    fold code1; eapply transitions_smart_Ibranch;  [eauto with code | trivial]. 
   + (* la branche "else" est exécutée *)
-    replace (pc + codelen codeb + codelen code1 + codelen code2 + 1)
-       with (pc + codelen codeb + codelen code1 + 1 + codelen code2) by lia.
-    apply IHcexec. eauto with code.
-
+    apply IHcexec; eauto with code.
+    
 - (* WHILE stop *)
-  set (code_body := compile_com c) in *.
-  set (code_branch := compile_bexp b 0 (codelen code_body + 1)) in *.
-  set (d := - (codelen code_branch + codelen code_body + 1)) in *.
-  eapply star_trans. apply compile_bexp_correct with (b := b). eauto with code.
-  rewrite H. fold code_branch. autorewrite with code. apply star_refl. 
-
+  set (code_body := compile_com c) in *;
+  set (delta1 := len_bexp (red_bexp b)) in *;
+  set (d := - (codelen code_body + delta1)) in *;
+  set (code_branch := compile_bexp (red_bexp b) d 0) in *.
+  rewrite beval_red in H.
+    (* branch *)  eapply star_trans; [apply star_one; eapply trans_branch; eauto with code | idtac].  
+    (* test --> done *) eapply star_trans; [apply compile_bexp_correct with (b := (red_bexp b)); eauto with code | idtac].
+  (* rewrite *) rewrite H; fold code_branch; autorewrite with code; rewrite <- Z.add_assoc; rewrite <- codelen_app; unfold codelen.
+  replace (pc + 1 + Z.of_nat (Datatypes.length (code_body ++ code_branch))) with (pc + Z.pos (Pos.of_succ_nat (Datatypes.length (code_body ++ code_branch)))) by lia.
+  (* finallement... *) apply star_refl.
+  
 - (* WHILE loop *)
-  set (code_body := compile_com c) in *.
-  set (code_branch := compile_bexp b 0 (codelen code_body + 1)) in *.
-  set (d := - (codelen code_branch + codelen code_body + 1)) in *.
-  eapply star_trans. apply compile_bexp_correct with (b := b). eauto with code.
-  rewrite H. fold code_branch. autorewrite with code.
-  eapply star_trans. apply IHcexec1. eauto with code.
-  eapply star_trans.
-  apply star_one. apply trans_branch with (d := d). eauto with code. eauto.
-  replace (pc + codelen code_branch + codelen code_body + 1 + d)
-     with pc
-       by lia.
-  replace (pc + codelen code_branch + codelen code_body + 1)
-     with (pc + codelen (compile_com (WHILE b c)))
-       by (cbn; autorewrite with code; auto).
-  apply IHcexec2. auto.
+  set (code_body := compile_com c) in *;
+  set (delta1 := len_bexp (red_bexp b)) in *;
+  set (d := - (codelen code_body + delta1)) in *;
+  set (code_branch := compile_bexp (red_bexp b) d 0) in *.
+  rewrite beval_red in H.
+  (* 1st iteration *)
+  (* branch *)
+  eapply star_trans; [apply star_one; eapply trans_branch; eauto with code | idtac].
+  (* test --> do *)
+  eapply star_trans; [apply compile_bexp_correct with (b := (red_bexp b)); eauto with code | idtac]. 
+  (* rewrite *)
+  rewrite H; fold code_branch; autorewrite with code.
+  (* On doit maintenant montrer qu'on a sauté au bon endroit (ie au début du corp de la boucle). *)
+  assert (delta1 = codelen code_branch); unfold delta1; unfold code_branch.
+  (* Ici, on aimerait appliquer directement le lemme correct_len_bexp_d_O, montré plus haut. Mais il faudra montrer que d <> 0, ce qui est faux pour un unique cas particulier : lorsqu'on compile "WHILE FALSE SKIP"... à cause de ce cas particulier qu'aucun programmeur n'écrirait, on doit faire quelques détours dans notre preuve ! :( *)
+  induction delta1 eqn:H3.
+  + (* delta1 = 0 -> red_bexp b = FALSE *)
+    assert (red_bexp b = FALSE) as Hb_f; [apply len_FALSE_eq_O; [apply red_bexp_is_red | apply H3] | rewrite Hb_f; cbn; auto].
+  + (* si delta1 > 0 on applique le correct_len_bexp_d_O (cas particulier de correct_len_bexp) *)
+    apply correct_len_bexp_d_O.
+    assert (0 <= codelen code_body); [apply Zle_0_nat | idtac].
+    assert (d < 0); lia.
+  + (* si delta1 < 0, ça contredit len_bexp_geq_O *)
+    assert (len_bexp (red_bexp b) >= 0) ; [apply len_bexp_geq_O | lia].
+  + (* Enfin, on peut utiliser delta1 = codelen code_branch *)
+  fold code_branch; replace (pc + 1 + codelen code_body + codelen code_branch + d) with (pc + 1) by lia.
+  (* do body *)
+  eapply star_trans; [apply IHcexec1; eauto with code | idtac].
+  (* Pour les itérations suivantes, on utilise le lemme compile_after_branch. *)
+  apply compile_after_branch; eauto with code.
+  assert (0 <= codelen code_body); [apply Zle_0_nat | idtac].
+  assert (0 <= codelen code_branch); [apply Zle_0_nat | idtac].
+  lia.
 Qed.
 
 (** En corollaire, nous obtenons la correction du code compilé pour un
@@ -631,24 +896,6 @@ Proof.
 - apply compile_com_correct_terminating. auto. eauto with code.
 - eauto with code.
 Qed.
-
-(** *** Exercice (2 étoiles) *)
-
-(** Dans un exercice précédent, vous avez modifié [compile_com] afin
-    d'utiliser [smart_Ibranch] au lieu de [Ibranch] et de produire
-    du code plus efficace.  Il vous reste à adapter la démonstration
-    de [compile_com_correct_terminating] en conséquence.
-    Indication: montrer d'abord le lemme ci-dessous. *)
-
-Lemma transitions_smart_Ibranch:
-  forall C pc d pc' σ s,
-  code_at C pc (smart_Ibranch d) ->
-  pc' = pc + codelen (smart_Ibranch d) + d ->
-  transitions C (pc, σ, s) (pc', σ, s).
-Proof.
-  unfold smart_Ibranch; intros.
-  (* À COMPLÉTER *)
-Abort.
 
 (** *** Exercice (4 étoiles). *)
 
@@ -713,6 +960,28 @@ Abort.
     décrits dans [k], puis atteignent une instruction [Ihalt].
 *)
 
+(*Inductive compile_cont (C: code): cont -> Z -> Prop :=
+  | ccont_stop: forall pc,
+      instr_at C pc = Some Ihalt ->
+      compile_cont C Kstop pc
+  | ccont_seq: forall c k pc pc',
+      code_at C pc (compile_com c) ->
+      pc' = pc + codelen (compile_com c) ->
+      compile_cont C k pc' ->
+      compile_cont C (Kseq c k) pc
+  | ccont_while: forall b c k pc d pc' pc'',
+      code_at C pc (compile_bexp b d 0) ->
+      pc' = pc + codelen (compile_bexp b d 0) + d - 1 ->
+      code_at C pc' (compile_com (WHILE b c)) ->
+      pc'' = pc' + codelen (compile_com (WHILE b c)) ->
+      compile_cont C k pc'' ->
+      compile_cont C (Kwhile b c k) pc
+  | ccont_branch: forall d k pc pc',
+      instr_at C pc = Some(Ibranch d) ->
+      pc' = pc + 1 + d ->
+      compile_cont C k pc' ->
+      compile_cont C k pc.*)
+
 Inductive compile_cont (C: code): cont -> Z -> Prop :=
   | ccont_stop: forall pc,
       instr_at C pc = Some Ihalt ->
@@ -734,7 +1003,7 @@ Inductive compile_cont (C: code): cont -> Z -> Prop :=
       pc' = pc + 1 + d ->
       compile_cont C k pc' ->
       compile_cont C k pc.
-
+  
 (** Dès lors, une configuration [(c,k,s)] de la sémantique à continuations
     d'IMP est reliée à une configuration [(C, pc, σ, s')] de la machine
     si les conditions suivantes sont vraies:
@@ -823,7 +1092,7 @@ Proof.
 - exists pc; split. apply star_refl. auto.
 - destruct IHcompile_cont as (pc'' & A & B); auto.
   exists pc''; split; auto. 
-  eapply star_step; eauto. eapply trans_branch; eauto. 
+  eapply star_step; eauto. eapply trans_branch; eauto.
 Qed.
 
 Lemma compile_cont_Kseq_inv:
@@ -850,12 +1119,12 @@ Lemma compile_cont_Kwhile_inv:
   /\ compile_cont C k (pc' + codelen(compile_com (WHILE b c))).
 Proof.
   intros. dependent induction H.
-- exists (pc + 1 + d); split.
-  apply plus_one. eapply trans_branch; eauto. 
-  split; congruence.
-- edestruct IHcompile_cont as (pc'' & A & B & D). eauto.
-  exists pc''; split; auto.
-  eapply plus_left. eapply trans_branch; eauto. apply plus_star; auto. 
+  - exists (pc + 1 + d); split.
+    apply plus_one. eapply trans_branch; eauto. 
+    split; congruence.
+  - edestruct IHcompile_cont as (pc'' & A & B & D). eauto.
+    exists pc''; split; auto.
+    eapply plus_left. eapply trans_branch; eauto. apply plus_star; auto. 
 Qed.
 
 Lemma match_config_skip:
@@ -895,49 +1164,72 @@ Proof.
 
 - (* if *)
   set (code1 := compile_com c1) in *.
-  set (codeb := compile_bexp b 0 (codelen code1 + 1)) in *.
   set (code2 := compile_com c2) in *.
+  set (codeb := compile_bexp b 0 (codelen (code1 ++ smart_Ibranch (codelen code2)))) in *.
   autorewrite with code in *.
   econstructor; split.
-+ right; split.
+  + (* execution *)
+  right; split.
   apply compile_bexp_correct with (b := b). eauto with code. 
   destruct (beval b s); lia.
-+ fold codeb. destruct (beval b s).
-  * autorewrite with code. constructor. eauto with code.
-    eapply ccont_branch. eauto with code. eauto. 
-    fold code1.
-    replace (pc + codelen codeb + codelen code1 + 1 + codelen code2)
-       with (pc + codelen codeb + codelen code1 + codelen code2 + 1) by lia.
-    auto.
-  * autorewrite with code. constructor. eauto with code. auto.
-    fold code2.
-    replace (pc + codelen codeb + codelen code1 + 1 + codelen code2)
-       with (pc + codelen codeb + codelen code1 + codelen code2 + 1) by lia.
-    auto.
-
+  + (* invariant preservation *)
+    fold codeb. destruct (beval b s).
+    * (* then *)
+      autorewrite with code. constructor. eauto with code.
+      unfold smart_Ibranch in *; induction (codelen code2); autorewrite with code in *; cbn in *.
+      auto.
+      1,2: eapply ccont_branch; eauto with code.
+    * (* else *)
+      autorewrite with code. constructor; eauto with code.
+      
 - (* while stop *)
-  set (codec := compile_com c) in *.
-  set (codeb := compile_bexp b 0 (codelen codec + 1)) in *.
+  set (code_body := compile_com c) in *;
+  set (delta1 := len_bexp (red_bexp b)) in *;
+  set (d := - (codelen code_body + delta1)) in *;
+  set (code_branch := compile_bexp (red_bexp b) d 0) in *.
+  rewrite beval_red in H.
   econstructor; split.
-+ right; split.
-  apply compile_bexp_correct with (b := b). eauto with code.
+  + right; split.
+    (* branch *) eapply star_trans; [apply star_one; eapply trans_branch; eauto with code | idtac].
+    (* test --> done *) apply compile_bexp_correct with (b := red_bexp b). eauto with code.
   assert (com_size c > 0)%nat by apply com_size_nonzero. lia.
-+ rewrite H. fold codeb. autorewrite with code in *. 
-  apply match_config_skip. auto.
-
-- (* while loop *)
-  set (codec := compile_com c) in *.
-  set (codeb := compile_bexp b 0 (codelen codec + 1)) in *.
+  + rewrite H; fold code_branch; autorewrite with code in *; rewrite <- Z.add_assoc; rewrite <- codelen_app; unfold codelen. 
+  apply match_config_skip.
+  replace (pc + 1 + Z.of_nat (Datatypes.length (code_body ++ code_branch))) with (pc + Z.pos (Pos.of_succ_nat (Datatypes.length (code_body ++ code_branch)))) by lia; auto.
+  
+- (* while loop *) 
+  set (code_body := compile_com c) in *;
+  set (delta1 := len_bexp (red_bexp b)) in *;
+  set (d := - (codelen code_body + delta1)) in *;
+    set (code_branch := compile_bexp (red_bexp b) d 0) in *.
+  rewrite beval_red in H.
   econstructor; split.
-+ right; split.
-  apply compile_bexp_correct with (b := b). eauto with code.
-  lia.
-+ rewrite H. fold codeb. autorewrite with code in *. 
-  constructor. eauto with code.
-  eapply ccont_while with (pc' := pc). eauto with code. fold codec. lia.
-  auto.
-  cbn. fold codec; fold codeb. eauto. 
-  autorewrite with code. auto.
+  + right; split.
+    (* branch *) eapply star_trans; [apply star_one; eapply trans_branch; eauto with code | idtac].
+    (* test --> do *) apply compile_bexp_correct with (b := red_bexp b); eauto with code.
+    lia.
+  + rewrite H; fold code_branch.
+
+    (* On doit maintenant montrer qu'on a sauté au bon endroit (ie au début du corp de la boucle). *)
+    assert (delta1 = codelen code_branch); unfold delta1; unfold code_branch.
+    (* Comme pour la preuve de correction dans les cas où le programme termine, la preuve est un peu laborieuse... *)
+    induction delta1 eqn:H3.
+      * (* delta1 = 0 -> red_bexp b = FALSE *)
+        assert (red_bexp b = FALSE) as Hb_f; [apply len_FALSE_eq_O; [apply red_bexp_is_red | apply H3] | rewrite Hb_f; cbn; auto].
+      * (* si delta1 > 0 on applique le correct_len_bexp_d_O (cas particulier de correct_len_bexp) *)
+        apply correct_len_bexp_d_O.
+        assert (0 <= codelen code_body); [apply Zle_0_nat | idtac].
+        assert (d < 0); lia.
+      * (* si delta1 < 0, ça contredit len_bexp_geq_O *)
+        assert (len_bexp (red_bexp b) >= 0) ; [apply len_bexp_geq_O | lia].
+      * (* Enfin, on peut utiliser delta1 = codelen code_branch *)
+        fold code_branch; replace (pc + 1 + codelen code_body + codelen code_branch + d) with (pc + 1) by lia.
+        
+    constructor; [eauto with code | idtac]. admit.
+   (* eapply ccont_while with (pc' := pc). eauto with code. fold codec. lia.
+    auto.
+    cbn. fold codec; fold codeb. eauto. 
+    autorewrite with code. auto.*)
 
 - (* skip seq *)
   autorewrite with code in *.
@@ -952,7 +1244,8 @@ Proof.
   econstructor; split.
 + left. eauto.
 + constructor; auto.
-Qed.
+Admitted.
+
 
 (** Le plus dur est fait!  De jolies conséquences vont suivre, à l'aide des
     théorèmes généraux sur les simulations fournis par le module [Simulation].
