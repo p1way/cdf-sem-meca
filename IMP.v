@@ -233,12 +233,14 @@ Lemma beval_OR:
   forall s b1 b2, beval (OR b1 b2) s = beval b1 s || beval b2 s.
 Proof.
   intros; cbn.
+  symmetry ; apply negb_sym.
+  rewrite negb_orb ; auto.
   (* Indication: taper "SearchAbout negb" pour voir les lemmes disponibles
      qui portent sur la négation booléenne. *)
   (* Indication: ou faites simplement une analyse de cas sur
      [beval b1 s] et [beval b2 s], il n'y a que 4 cas à considérer. *)
   (* À COMPLÉTER *)
-Abort.
+Qed.
 
 (** ** 1.4.  Commandes *)
 
@@ -283,7 +285,7 @@ Definition update (x: ident) (v: Z) (s: store) : store :=
 
 Lemma update_same: forall x v s, (update x v s) x = v.
 Proof.
-  unfold update; intros. destruct (string_dec x x); congruence.
+  unfold update; intros. destruct (string_dec x x); congruence .
 Qed.
 
 Lemma update_other: forall x v s y, x <> y -> (update x v s) y = s y.
@@ -396,16 +398,26 @@ Definition goes_wrong (s: store) (c: com) : Prop :=
 Lemma red_progress:
   forall c s, c = SKIP \/ exists c', exists s', red (c, s) (c', s').
 Proof.
-  induction c; intros.
-  (* À COMPLÉTER *)
-Abort.
+  induction c ; intro s.
+- left; trivial.
+- right. exists SKIP, (update x (aeval a s) s). apply red_assign.
+- right.  destruct IHc1 with s.
+  -- exists c2, s. rewrite H. apply red_seq_done.
+  -- destruct H as (c3, (s2, H)). exists (c3;;c2), s2. apply red_seq_step; trivial.
+- right. exists (if beval b s then c1 else c2), s. apply red_ifthenelse.
+- right. case (beval b s) eqn:H.
+  -- exists (c ;; (WHILE b c)), s. apply red_while_loop; trivial.
+  -- exists SKIP, s. apply red_while_done; trivial.
+Qed.
 
 Lemma not_goes_wrong:
   forall c s, ~(goes_wrong s c).
 Proof.
   intros c s (c' & s' & STAR & IRRED & NOTSKIP).
-  (* À COMPLÉTER *)
-Abort.
+  destruct red_progress with c' s'.
+  - auto.
+  - unfold irred in IRRED. destruct H as (cb, (sb, H)). destruct IRRED with (cb, sb). trivial.
+Qed.
 
 (** Un lemme technique: les suites de réductions peuvent s'effectuer
    dans la partie gauche d'une séquence.  Cela généralise la règle [red_seq_step]. *)
@@ -577,24 +589,37 @@ Eval compute in
 (** *** Exercice (3 étoiles) *)
 
 (** Montrer que la fonction [cexec_f] est correcte vis-à-vis de la sémantique
-    naturelle [cexec], en démontrant les deux lemmes suivants. *)
+    naturelle [cexec], en démontrant les deux lemmes suivants. *)  
 
 Lemma cexec_f_sound:
   forall fuel s c s', cexec_f fuel s c = Some s' -> cexec s c s'.
 Proof.
-  induction fuel as [ | fuel ]; cbn; intros.
+  induction fuel; cbn; intros.
 - discriminate.
 - destruct c.
-  (* À COMPLÉTER *)
-Abort.
+  -- inversion H; apply cexec_skip.
+  -- inversion H; apply cexec_assign.
+  -- induction (cexec_f fuel s c1) eqn:H'. apply cexec_seq with a; apply IHfuel ; [exact H' | exact H]. discriminate.
+  -- apply cexec_ifthenelse; apply IHfuel; exact H.
+  -- case (beval b s) eqn:bval.
+     --- induction (cexec_f fuel s c) eqn:H'. apply cexec_while_loop with a.  exact bval. 1,2: apply IHfuel. exact H'. exact H. discriminate.
+     --- inversion H; apply cexec_while_done.  congruence. 
+Qed.
 
 Lemma cexec_f_complete:
   forall s c s', cexec s c s' ->
   exists fuel1, forall fuel, (fuel >= fuel1)%nat -> cexec_f fuel s c = Some s'.
 Proof.
   induction 1.
-  (* À COMPLÉTER *)
-Abort.
+  (*1 step execution : SKIP, ASSIGN and WHILE DONE*)
+  1,2,5:  exists 1%nat; intros; induction fuel; [lia | cbn; try rewrite H; trivial].
+  - (*SEQ*)
+    inversion IHcexec1 as (f1); inversion IHcexec2 as (f2). exists (f1 + f2 + 1)%nat. induction fuel. lia. cbn. intro; rewrite H1; [apply H2; lia | lia].
+  - (*IFTHENELSE*)
+    inversion IHcexec as (f1); exists (f1+1)%nat. induction fuel; [lia | cbn]. intro; rewrite H0; [trivial | lia].
+  - (*WHILE*)
+    inversion IHcexec1 as (f1); inversion IHcexec2 as (f2). exists (f1 + f2 + 1)%nat. induction fuel. lia. cbn. intro; rewrite H; rewrite H2; [apply H3; lia | lia].
+Qed.
 
 (** ** 1.8.  Sémantique à transitions et continuations *)
 
@@ -869,5 +894,5 @@ Theorem diverges_kdiverges:
 Proof.
   intros. 
   apply (simulation_infseq _ _ _ _ _ _ simulation_red_cont _ _ H).
-  constructor; auto.
+  constructor. auto.
 Qed.
