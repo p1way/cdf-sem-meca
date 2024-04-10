@@ -2,6 +2,7 @@
 .coqdeps.d
 CoqMakefile
 CoqMakefile.conf
+.CoqMakefile.d
 .*.aux
 *.a
 *.cma
